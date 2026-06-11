@@ -1,0 +1,23 @@
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+env
+.git
+.gitignore
+.pytest_cache
+.mypy_cache
+.ruff_cache
+# Secrets are injected at runtime via compose env_file, not baked into the image.
+.env
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+# Throwaway verification scripts.
+_verify*.py
+_add*.py
+.vscode
+.idea
+.DS_Store

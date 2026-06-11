@@ -1,0 +1,15 @@
+services:
+  backend:
+    # Run a prebuilt image. Build it first with the Dockerfile:
+    #   docker build -t plantview-backend:latest .
+    image: pf811/plantview-backend:001
+    container_name: plantview-backend
+    # Configuration (DB creds, SECRET_KEY, CORS_ORIGINS, ...) comes from .env.
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # FastAPI + one uvicorn worker fits comfortably here.
+    mem_limit: 256m
+    mem_reservation: 64m
