@@ -5,7 +5,7 @@ generic JSONB field-aggregation primitive that takes the field key + op as input
 """
 from typing import Any
 
-from sqlalchemy import Float, cast, func, select
+from sqlalchemy import Float, and_, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.enums import FieldScope
@@ -23,6 +23,10 @@ _AGG_OPS = {
 ALLOWED_OPS = set(_AGG_OPS) | {"count"}
 _INTERVALS = {"day", "week", "month"}
 
+# Soft-deleted batches must not show up in any metric, otherwise the dashboard
+# disagrees with the batch list. Every query below filters on this.
+_LIVE_BATCH = Batch.deleted_at.is_(None)
+
 
 def _f(v: Any) -> float | None:
     return float(v) if v is not None else None
@@ -33,7 +37,9 @@ def _f(v: Any) -> float | None:
 # --------------------------------------------------------------------------- #
 def overview(db: Session) -> dict:
     by_status = dict(
-        db.execute(select(Batch.status, func.count()).group_by(Batch.status)).all()
+        db.execute(
+            select(Batch.status, func.count()).where(_LIVE_BATCH).group_by(Batch.status)
+        ).all()
     )
     return {
         "templates_total": db.scalar(select(func.count()).select_from(Template)),
@@ -44,16 +50,30 @@ def overview(db: Session) -> dict:
         "machines_active": db.scalar(
             select(func.count()).select_from(Machine).where(Machine.is_active.is_(True))
         ),
-        "batches_total": db.scalar(select(func.count()).select_from(Batch)),
+        "batches_total": db.scalar(select(func.count()).select_from(Batch).where(_LIVE_BATCH)),
         "batches_by_status": by_status,
-        "stage_entries_total": db.scalar(select(func.count()).select_from(StageEntry)),
-        "machine_entries_total": db.scalar(select(func.count()).select_from(MachineEntry)),
+        "stage_entries_total": db.scalar(
+            select(func.count())
+            .select_from(StageEntry)
+            .join(Batch, Batch.id == StageEntry.batch_id)
+            .where(_LIVE_BATCH)
+        ),
+        "machine_entries_total": db.scalar(
+            select(func.count())
+            .select_from(MachineEntry)
+            .join(StageEntry, StageEntry.id == MachineEntry.stage_entry_id)
+            .join(Batch, Batch.id == StageEntry.batch_id)
+            .where(_LIVE_BATCH)
+        ),
     }
 
 
 def batches_by_status(db: Session) -> list[dict]:
     rows = db.execute(
-        select(Batch.status, func.count()).group_by(Batch.status).order_by(Batch.status)
+        select(Batch.status, func.count())
+        .where(_LIVE_BATCH)
+        .group_by(Batch.status)
+        .order_by(Batch.status)
     ).all()
     return [{"status": s, "count": n} for s, n in rows]
 
@@ -62,6 +82,7 @@ def batches_by_template(db: Session) -> list[dict]:
     rows = db.execute(
         select(Template.id, Template.name, func.count(Batch.id))
         .join(Batch, Batch.template_id == Template.id)
+        .where(_LIVE_BATCH)
         .group_by(Template.id, Template.name)
         .order_by(func.count(Batch.id).desc())
     ).all()
@@ -74,7 +95,7 @@ def batches_timeseries(
     if interval not in _INTERVALS:
         raise BadRequest(f"interval must be one of {sorted(_INTERVALS)}")
     period = func.date_trunc(interval, Batch.created_at).label("period")
-    stmt = select(period, func.count()).group_by(period).order_by(period)
+    stmt = select(period, func.count()).where(_LIVE_BATCH).group_by(period).order_by(period)
     if template_id is not None:
         stmt = stmt.where(Batch.template_id == template_id)
     if status is not None:
@@ -87,7 +108,7 @@ def batches_by_current_stage(db: Session, *, template_id: int) -> list[dict]:
     counts = dict(
         db.execute(
             select(Batch.current_stage_id, func.count())
-            .where(Batch.template_id == template_id)
+            .where(Batch.template_id == template_id, _LIVE_BATCH)
             .group_by(Batch.current_stage_id)
         ).all()
     )
@@ -114,8 +135,13 @@ def machine_activity(db: Session) -> list[dict]:
             func.count(MachineEntry.id),
             func.count(func.distinct(StageEntry.batch_id)),
         )
+        .select_from(Machine)
         .outerjoin(MachineEntry, MachineEntry.machine_id == Machine.id)
         .outerjoin(StageEntry, StageEntry.id == MachineEntry.stage_entry_id)
+        # Join only live batches, then drop the entries that failed to match.
+        # Machines with no activity at all still survive and report zero.
+        .outerjoin(Batch, and_(Batch.id == StageEntry.batch_id, _LIVE_BATCH))
+        .where(or_(MachineEntry.id.is_(None), Batch.id.isnot(None)))
         .group_by(Machine.id, Machine.name, Machine.code)
         .order_by(func.count(MachineEntry.id).desc())
     ).all()
@@ -165,35 +191,37 @@ def field_aggregate(
     measure = func.count() if op == "count" else _AGG_OPS[op](value)
 
     if not is_machine:
-        stmt = select(measure).where(is_number)
+        # Always join Batch so soft-deleted batches are excluded.
+        stmt = (
+            select(measure)
+            .select_from(StageEntry)
+            .join(Batch, Batch.id == StageEntry.batch_id)
+            .where(is_number, _LIVE_BATCH)
+        )
         if stage_id is not None:
             stmt = stmt.where(StageEntry.stage_id == stage_id)
         if template_id is not None:
-            stmt = stmt.join(Batch, Batch.id == StageEntry.batch_id).where(
-                Batch.template_id == template_id
-            )
+            stmt = stmt.where(Batch.template_id == template_id)
         return {"scope": scope, "field": field, "op": op, "value": _f(db.scalar(stmt)), "groups": []}
 
-    # machine scope
-    needs_se = stage_id is not None or template_id is not None
-
+    # machine scope — the StageEntry/Batch join is now unconditional, since
+    # excluding soft-deleted batches always requires reaching the batch.
     def _apply_machine_filters(stmt):
+        stmt = stmt.join(StageEntry, StageEntry.id == MachineEntry.stage_entry_id).join(
+            Batch, Batch.id == StageEntry.batch_id
+        ).where(_LIVE_BATCH)
         if machine_id is not None:
             stmt = stmt.where(MachineEntry.machine_id == machine_id)
-        if needs_se:
-            stmt = stmt.join(StageEntry, StageEntry.id == MachineEntry.stage_entry_id)
-            if stage_id is not None:
-                stmt = stmt.where(StageEntry.stage_id == stage_id)
-            if template_id is not None:
-                stmt = stmt.join(Batch, Batch.id == StageEntry.batch_id).where(
-                    Batch.template_id == template_id
-                )
+        if stage_id is not None:
+            stmt = stmt.where(StageEntry.stage_id == stage_id)
+        if template_id is not None:
+            stmt = stmt.where(Batch.template_id == template_id)
         return stmt
 
     if group_by == "machine":
         stmt = select(
             MachineEntry.machine_id, Machine.name, measure, func.count()
-        ).join(Machine, Machine.id == MachineEntry.machine_id).where(is_number)
+        ).select_from(MachineEntry).join(Machine, Machine.id == MachineEntry.machine_id).where(is_number)
         stmt = _apply_machine_filters(stmt)
         stmt = stmt.group_by(MachineEntry.machine_id, Machine.name).order_by(MachineEntry.machine_id)
         groups = [
@@ -202,7 +230,7 @@ def field_aggregate(
         ]
         return {"scope": scope, "field": field, "op": op, "value": None, "groups": groups}
 
-    stmt = _apply_machine_filters(select(measure).where(is_number))
+    stmt = _apply_machine_filters(select(measure).select_from(MachineEntry).where(is_number))
     return {"scope": scope, "field": field, "op": op, "value": _f(db.scalar(stmt)), "groups": []}
 
 

@@ -2,7 +2,7 @@
 
 Reads: any authenticated user. Create/enter data: operator or admin. Delete: admin.
 """
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -13,11 +13,13 @@ from app.models.user import User
 from app.schemas.operations import (
     BatchColorTargetsSet,
     BatchCreate,
+    BatchDesignsSet,
     BatchMaterialsSet,
     BatchRead,
     BatchStatusUpdate,
     BatchSummary,
     BatchUpdate,
+    StageEntriesBulkCreate,
     StageEntryRead,
     StageEntrySubmit,
 )
@@ -33,10 +35,12 @@ admin_only = [Depends(require_roles(Role.ADMIN))]
 def list_batches(
     template_id: int | None = None,
     status: BatchStatus | None = None,
+    search: str | None = Query(None, max_length=80, description="Case-insensitive batch code match"),
     db: Session = Depends(get_db),
 ):
+    """List live batches. Soft-deleted batches are never returned."""
     return batch_service.list_batches(
-        db, template_id=template_id, status=status.value if status else None
+        db, template_id=template_id, status=status.value if status else None, search=search
     )
 
 
@@ -90,6 +94,19 @@ def set_batch_color_targets(
     )
 
 
+@router.put("/{batch_id}/designs", response_model=BatchRead, dependencies=operator_or_admin)
+def set_batch_designs(
+    batch_id: int,
+    payload: BatchDesignsSet,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set which designs this lot may use. Empty list = no restriction (all designs)."""
+    return batch_service.set_batch_designs(
+        db, batch_id, payload.design_ids, actor_id=current_user.id
+    )
+
+
 @router.patch("/{batch_id}/status", response_model=BatchRead, dependencies=operator_or_admin)
 def update_batch_status(
     batch_id: int,
@@ -106,6 +123,7 @@ def delete_batch(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Soft delete a batch: it disappears from all reads but no rows are removed."""
     batch_service.delete_batch(db, batch_id, actor_id=current_user.id)
 
 
@@ -120,6 +138,21 @@ def create_stage_entry(
 ):
     """Add a new entry for a stage (validated against field_defs). A stage may have many entries."""
     return batch_service.create_stage_entry(db, batch_id, stage_id, payload, actor_id=current_user.id)
+
+
+@router.post("/{batch_id}/stages/{stage_id}/entries/bulk", response_model=list[StageEntryRead],
+             status_code=status.HTTP_201_CREATED, dependencies=operator_or_admin)
+def create_stage_entries_bulk(
+    batch_id: int,
+    stage_id: int,
+    payload: StageEntriesBulkCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Add several entries for a stage in one atomic call (e.g. one per colour)."""
+    return batch_service.create_stage_entries_bulk(
+        db, batch_id, stage_id, payload.entries, actor_id=current_user.id
+    )
 
 
 @router.put("/{batch_id}/entries/{entry_id}", response_model=StageEntryRead,

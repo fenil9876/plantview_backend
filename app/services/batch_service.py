@@ -1,4 +1,6 @@
 """Batch lifecycle + validated stage/machine data entry, with audit."""
+from datetime import datetime, timezone
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,7 @@ from app.models.inventory import InventoryItem
 from app.models.operations import (
     Batch,
     BatchColorTarget,
+    BatchDesign,
     BatchMaterial,
     MachineEntry,
     StageEntry,
@@ -29,20 +32,35 @@ from app.services.field_validation import validate_payload
 # Batches
 # --------------------------------------------------------------------------- #
 def get_batch(db: Session, batch_id: int) -> Batch:
+    """Fetch a live batch. Soft-deleted batches read as 'not found'."""
     batch = db.get(Batch, batch_id)
-    if batch is None:
+    if batch is None or batch.deleted_at is not None:
         raise NotFound(f"Batch {batch_id} not found")
     return batch
 
 
 def list_batches(
-    db: Session, *, template_id: int | None = None, status: str | None = None
+    db: Session,
+    *,
+    template_id: int | None = None,
+    status: str | None = None,
+    search: str | None = None,
 ) -> list[Batch]:
-    stmt = select(Batch).order_by(Batch.created_at.desc(), Batch.id.desc())
+    stmt = (
+        select(Batch)
+        .where(Batch.deleted_at.is_(None))
+        .order_by(Batch.created_at.desc(), Batch.id.desc())
+    )
     if template_id is not None:
         stmt = stmt.where(Batch.template_id == template_id)
     if status is not None:
         stmt = stmt.where(Batch.status == status)
+    if search:
+        # Case-insensitive substring match on the batch code. Escape the LIKE
+        # wildcards so a user typing "%" searches for a literal percent sign.
+        term = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        if term:
+            stmt = stmt.where(Batch.code.ilike(f"%{term}%", escape="\\"))
     return list(db.scalars(stmt).all())
 
 
@@ -50,7 +68,13 @@ def create_batch(db: Session, payload: BatchCreate, actor_id: int | None) -> Bat
     template = template_service.get_template(db, payload.template_id)
     if not template.is_active:
         raise BadRequest("Cannot create a batch on an inactive template")
-    if db.scalar(select(Batch).where(Batch.code == payload.code)):
+    # Codes stay reserved after a soft delete, so check against every row.
+    existing = db.scalar(select(Batch).where(Batch.code == payload.code))
+    if existing is not None:
+        if existing.deleted_at is not None:
+            raise Conflict(
+                f"Batch code '{payload.code}' belongs to a deleted batch and cannot be reused"
+            )
         raise Conflict(f"Batch code '{payload.code}' already exists")
 
     first_stage = template.stages[0] if template.stages else None
@@ -190,6 +214,34 @@ def set_batch_color_targets(
     return batch
 
 
+def set_batch_designs(
+    db: Session, batch_id: int, design_ids: list[int], actor_id: int | None
+) -> Batch:
+    """Set which designs this lot may use (replaces the existing set).
+
+    No quantity is planned per design — this only narrows the design picker during
+    data entry. An empty list clears the restriction, leaving every design selectable.
+    """
+    batch = get_batch(db, batch_id)
+    wanted = list(dict.fromkeys(design_ids))  # de-duplicate, keep order
+
+    if wanted:
+        found = set(db.scalars(select(Design.id).where(Design.id.in_(wanted))).all())
+        missing = set(wanted) - found
+        if missing:
+            raise BadRequest(f"Unknown designs: {sorted(missing)}")
+
+    before = [bd.design_id for bd in batch.designs]
+    batch.designs = [BatchDesign(design_id=did) for did in wanted]
+    audit_service.record(
+        db, entity_type="batch", entity_id=batch.id, action=AuditAction.UPDATE,
+        actor_id=actor_id, before={"designs": before}, after={"designs": wanted},
+    )
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
 def update_status(db: Session, batch_id: int, status: BatchStatus, actor_id: int | None) -> Batch:
     batch = get_batch(db, batch_id)
     before = batch.status
@@ -204,19 +256,19 @@ def update_status(db: Session, batch_id: int, status: BatchStatus, actor_id: int
 
 
 def delete_batch(db: Session, batch_id: int, actor_id: int | None) -> None:
+    """Soft delete: hide the batch everywhere without removing any rows.
+
+    Deliberately does NOT return consumed materials to inventory — the batch and
+    its entries still exist, so that consumption is still real. The batch code
+    also stays reserved, so it cannot be reused by a new batch.
+    """
     batch = get_batch(db, batch_id)
-    # Return any consumed materials to main inventory.
-    if batch.materials:
-        ids = [bm.inventory_item_id for bm in batch.materials]
-        inv = {i.id: i for i in db.scalars(select(InventoryItem).where(InventoryItem.id.in_(ids))).all()}
-        for bm in batch.materials:
-            if bm.inventory_item_id in inv:
-                inv[bm.inventory_item_id].quantity += bm.quantity
+    batch.deleted_at = datetime.now(timezone.utc)
+    batch.deleted_by = actor_id
     audit_service.record(
         db, entity_type="batch", entity_id=batch.id, action=AuditAction.DELETE,
-        actor_id=actor_id, before={"code": batch.code},
+        actor_id=actor_id, before={"code": batch.code}, after={"deleted": True},
     )
-    db.delete(batch)
     db.commit()
 
 
@@ -353,6 +405,55 @@ def create_stage_entry(
     db.commit()
     db.refresh(entry)
     return entry
+
+
+def create_stage_entries_bulk(
+    db: Session, batch_id: int, stage_id: int, payloads: list[StageEntrySubmit],
+    actor_id: int | None,
+) -> list[StageEntry]:
+    """Create several entries for one stage atomically (e.g. one per colour).
+
+    Every payload is validated first; if any fails, nothing is written and the
+    collected errors — each tagged with its list ``index`` — are raised together.
+    """
+    batch = get_batch(db, batch_id)
+    stage = template_service.get_stage(db, batch.template_id, stage_id)
+
+    # Validate all first so the whole batch is atomic.
+    validated: list[tuple[StageEntrySubmit, dict, list[dict]]] = []
+    all_errors: list[dict] = []
+    for index, payload in enumerate(payloads):
+        try:
+            _validate_design_color(db, payload)
+            clean_data, clean_machines = _validate_payload_for_stage(stage, payload)
+        except DataValidationError as exc:
+            all_errors.extend({**e, "index": index} for e in exc.errors)
+            continue
+        except BadRequest as exc:
+            all_errors.append({"index": index, "scope": "entry", "field": "entry",
+                               "error": exc.detail})
+            continue
+        validated.append((payload, clean_data, clean_machines))
+    if all_errors:
+        raise DataValidationError(all_errors)
+
+    entries: list[StageEntry] = []
+    for payload, clean_data, clean_machines in validated:
+        entry = StageEntry(batch_id=batch_id, stage_id=stage_id)
+        db.add(entry)
+        _apply_entry(entry, payload, clean_data, clean_machines, actor_id)
+        db.flush()
+        audit_service.record(
+            db, entity_type="stage_entry", entity_id=entry.id, action=AuditAction.CREATE,
+            actor_id=actor_id, after=_entry_snapshot(entry),
+        )
+        entries.append(entry)
+
+    _advance_current_stage(db, batch, stage)
+    db.commit()
+    for entry in entries:
+        db.refresh(entry)
+    return entries
 
 
 def update_stage_entry(

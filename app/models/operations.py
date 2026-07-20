@@ -1,9 +1,10 @@
 """Operational data models: a Batch flows through stages, accumulating entries."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,6 +31,18 @@ class Batch(TimestampMixin, Base):
     created_by: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # Soft delete: rows are never removed, just hidden from every read path.
+    # Consumed materials stay deducted from inventory, and the code stays reserved.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    deleted_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
 
     stage_entries: Mapped[list["StageEntry"]] = relationship(
         back_populates="batch",
@@ -42,6 +55,10 @@ class Batch(TimestampMixin, Base):
         lazy="selectin",
     )
     color_targets: Mapped[list["BatchColorTarget"]] = relationship(
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    designs: Mapped[list["BatchDesign"]] = relationship(
         cascade="all, delete-orphan",
         lazy="selectin",
     )
@@ -91,6 +108,30 @@ class BatchColorTarget(Base):
     @property
     def hex(self) -> str | None:
         return self.color.hex
+
+
+class BatchDesign(Base):
+    """Designs available to a lot. Purely a pick-list restriction for data entry —
+    no quantity is planned per design. An empty set means "no restriction": every
+    design stays selectable. One row per (batch, design)."""
+    __tablename__ = "batch_designs"
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("batches.id", ondelete="CASCADE"), primary_key=True
+    )
+    design_id: Mapped[int] = mapped_column(
+        ForeignKey("designs.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    design: Mapped["Design"] = relationship(lazy="joined")
+
+    @property
+    def name(self) -> str:
+        return self.design.name
+
+    @property
+    def description(self) -> str | None:
+        return self.design.description
 
 
 class StageEntry(TimestampMixin, Base):

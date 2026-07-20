@@ -37,6 +37,12 @@ class StageEntrySubmit(BaseModel):
     status: EntryStatus = EntryStatus.SUBMITTED
 
 
+class StageEntriesBulkCreate(BaseModel):
+    """Create several stage entries at once (e.g. one per colour) in a single transaction."""
+
+    entries: list[StageEntrySubmit] = Field(min_length=1)
+
+
 class StageEntryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -94,6 +100,21 @@ class BatchColorTargetRead(BaseModel):
     quantity: float
 
 
+# --------------------------- Batch designs --------------------------------- #
+class BatchDesignsSet(BaseModel):
+    """Designs a lot may use. Empty means no restriction (all designs selectable)."""
+
+    design_ids: list[int] = Field(default_factory=list)
+
+
+class BatchDesignRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    design_id: int
+    name: str
+    description: str | None
+
+
 # --------------------------- Batches --------------------------------------- #
 class BatchCreate(BaseModel):
     template_id: int
@@ -127,3 +148,4 @@ class BatchRead(BatchSummary):
     stage_entries: list[StageEntryRead]
     materials: list[BatchMaterialRead]
     color_targets: list[BatchColorTargetRead]
+    designs: list[BatchDesignRead]
