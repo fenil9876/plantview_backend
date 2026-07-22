@@ -59,6 +59,7 @@ class StageEntryRead(BaseModel):
     submitted_by: int | None
     submitted_by_name: str | None
     machine_entries: list[MachineEntryRead]
+    created_at: datetime
     updated_at: datetime
 
 
@@ -81,30 +82,34 @@ class BatchMaterialRead(BaseModel):
     quantity: float
 
 
-# --------------------------- Batch color split ----------------------------- #
-class BatchColorTargetSubmit(BaseModel):
+# --------------------------- Batch designs & their colours ----------------- #
+class BatchDesignColorSubmit(BaseModel):
     color_id: int
-    quantity: float = Field(ge=0)
+    quantity: float | None = Field(default=None, ge=0)
 
 
-class BatchColorTargetsSet(BaseModel):
-    targets: list[BatchColorTargetSubmit] = Field(default_factory=list)
+class BatchDesignSubmit(BaseModel):
+    design_id: int
+    colors: list[BatchDesignColorSubmit] = Field(default_factory=list)
 
 
-class BatchColorTargetRead(BaseModel):
+class BatchDesignsSet(BaseModel):
+    """The designs a lot runs, each with its own colours.
+
+    A design may appear only once, and must bring at least one colour. An empty
+    list clears the restriction: every design and colour stays selectable.
+    """
+
+    designs: list[BatchDesignSubmit] = Field(default_factory=list)
+
+
+class BatchDesignColorRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     color_id: int
     name: str
     hex: str | None
-    quantity: float
-
-
-# --------------------------- Batch designs --------------------------------- #
-class BatchDesignsSet(BaseModel):
-    """Designs a lot may use. Empty means no restriction (all designs selectable)."""
-
-    design_ids: list[int] = Field(default_factory=list)
+    quantity: float | None
 
 
 class BatchDesignRead(BaseModel):
@@ -113,6 +118,18 @@ class BatchDesignRead(BaseModel):
     design_id: int
     name: str
     description: str | None
+    colors: list[BatchDesignColorRead]
+
+
+class BatchColorTargetRead(BaseModel):
+    """Lot-wide colour total, rolled up across the designs. Read-only/derived."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    color_id: int
+    name: str
+    hex: str | None
+    quantity: float
 
 
 # --------------------------- Batches --------------------------------------- #

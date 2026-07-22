@@ -1,10 +1,19 @@
 """Operational data models: a Batch flows through stages, accumulating entries."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -54,14 +63,30 @@ class Batch(TimestampMixin, Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
-    color_targets: Mapped[list["BatchColorTarget"]] = relationship(
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
     designs: Mapped[list["BatchDesign"]] = relationship(
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+
+    @property
+    def color_targets(self) -> list["ColorRollup"]:
+        """Planned quantity per colour for the whole lot, rolled up across designs.
+
+        Colours are planned per design, but statistics and the lot-wide colour
+        picker only care about the colour, so the same colour used by two designs
+        adds up into one row here.
+        """
+        totals: dict[int, ColorRollup] = {}
+        for bd in self.designs:
+            for c in bd.colors:
+                prev = totals.get(c.color_id)
+                totals[c.color_id] = ColorRollup(
+                    color_id=c.color_id,
+                    name=c.name,
+                    hex=c.hex,
+                    quantity=(prev.quantity if prev else 0.0) + (c.quantity or 0.0),
+                )
+        return list(totals.values())
 
 
 class BatchMaterial(Base):
@@ -87,33 +112,23 @@ class BatchMaterial(Base):
         return self.item.unit
 
 
-class BatchColorTarget(Base):
-    """Planned per-color quantity split for a lot (lot-level bifurcation). One row per (batch, color)."""
-    __tablename__ = "batch_color_targets"
+@dataclass(frozen=True)
+class ColorRollup:
+    """A lot-wide colour total derived from the per-design colours. Not a table."""
 
-    batch_id: Mapped[int] = mapped_column(
-        ForeignKey("batches.id", ondelete="CASCADE"), primary_key=True
-    )
-    color_id: Mapped[int] = mapped_column(
-        ForeignKey("colors.id", ondelete="CASCADE"), primary_key=True
-    )
-    quantity: Mapped[float] = mapped_column(Float, nullable=False)
-
-    color: Mapped["Color"] = relationship(lazy="joined")
-
-    @property
-    def name(self) -> str:
-        return self.color.name
-
-    @property
-    def hex(self) -> str | None:
-        return self.color.hex
+    color_id: int
+    name: str
+    hex: str | None
+    quantity: float
 
 
 class BatchDesign(Base):
-    """Designs available to a lot. Purely a pick-list restriction for data entry —
-    no quantity is planned per design. An empty set means "no restriction": every
-    design stays selectable. One row per (batch, design)."""
+    """A design this lot runs, together with the colours it runs in.
+
+    One row per (batch, design) — the primary key is what stops a design from
+    being added to the same lot twice. An empty set for a batch means "no
+    restriction": every design and colour stays selectable during data entry.
+    """
     __tablename__ = "batch_designs"
 
     batch_id: Mapped[int] = mapped_column(
@@ -124,6 +139,10 @@ class BatchDesign(Base):
     )
 
     design: Mapped["Design"] = relationship(lazy="joined")
+    colors: Mapped[list["BatchDesignColor"]] = relationship(
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     @property
     def name(self) -> str:
@@ -132,6 +151,40 @@ class BatchDesign(Base):
     @property
     def description(self) -> str | None:
         return self.design.description
+
+
+class BatchDesignColor(Base):
+    """A colour one of the lot's designs runs in, with its optional planned quantity.
+
+    Colours belong to a design rather than the lot, so D1 can run in red+blue
+    while D2 runs in black only. ``quantity`` is the planning figure; ``None``
+    means the colour is available for entry but has no target.
+    """
+    __tablename__ = "batch_design_colors"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["batch_id", "design_id"],
+            ["batch_designs.batch_id", "batch_designs.design_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    batch_id: Mapped[int] = mapped_column(primary_key=True)
+    design_id: Mapped[int] = mapped_column(primary_key=True)
+    color_id: Mapped[int] = mapped_column(
+        ForeignKey("colors.id", ondelete="CASCADE"), primary_key=True
+    )
+    quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    color: Mapped["Color"] = relationship(lazy="joined")
+
+    @property
+    def name(self) -> str:
+        return self.color.name
+
+    @property
+    def hex(self) -> str | None:
+        return self.color.hex
 
 
 class StageEntry(TimestampMixin, Base):

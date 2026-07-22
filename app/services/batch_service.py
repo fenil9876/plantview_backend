@@ -9,16 +9,16 @@ from app.models.design import Color, Design
 from app.models.inventory import InventoryItem
 from app.models.operations import (
     Batch,
-    BatchColorTarget,
     BatchDesign,
+    BatchDesignColor,
     BatchMaterial,
     MachineEntry,
     StageEntry,
 )
 from app.models.template import Stage, Template
 from app.schemas.operations import (
-    BatchColorTargetSubmit,
     BatchCreate,
+    BatchDesignSubmit,
     BatchMaterialSubmit,
     BatchUpdate,
     StageEntrySubmit,
@@ -182,60 +182,74 @@ def update_batch(db: Session, batch_id: int, payload: BatchUpdate, actor_id: int
     return batch
 
 
-def set_batch_color_targets(
-    db: Session, batch_id: int, targets: list[BatchColorTargetSubmit], actor_id: int | None
-) -> Batch:
-    """Set the planned per-color quantity split for a lot (replaces the existing set)."""
-    batch = get_batch(db, batch_id)
-    new_map: dict[int, float] = {}
-    for t in targets:
-        if t.quantity <= 0:
-            continue  # zero means "not part of the split"
-        if t.color_id in new_map:
-            raise BadRequest(f"Duplicate color {t.color_id} in split")
-        new_map[t.color_id] = t.quantity
-
-    if new_map:
-        found = set(db.scalars(select(Color.id).where(Color.id.in_(new_map))).all())
-        missing = set(new_map) - found
-        if missing:
-            raise BadRequest(f"Unknown colors: {sorted(missing)}")
-
-    before = {ct.color_id: ct.quantity for ct in batch.color_targets}
-    batch.color_targets = [
-        BatchColorTarget(color_id=cid, quantity=q) for cid, q in new_map.items()
+def _designs_snapshot(designs) -> list[dict]:
+    """Audit-friendly view of a lot's designs and the colours under each."""
+    return [
+        {
+            "design_id": bd.design_id,
+            "colors": [{"color_id": c.color_id, "quantity": c.quantity} for c in bd.colors],
+        }
+        for bd in designs
     ]
-    audit_service.record(
-        db, entity_type="batch", entity_id=batch.id, action=AuditAction.UPDATE,
-        actor_id=actor_id, before={"color_targets": before}, after={"color_targets": new_map},
-    )
-    db.commit()
-    db.refresh(batch)
-    return batch
 
 
 def set_batch_designs(
-    db: Session, batch_id: int, design_ids: list[int], actor_id: int | None
+    db: Session, batch_id: int, designs: list[BatchDesignSubmit], actor_id: int | None
 ) -> Batch:
-    """Set which designs this lot may use (replaces the existing set).
+    """Set the designs this lot runs and the colours each one runs in (replaces the set).
 
-    No quantity is planned per design — this only narrows the design picker during
-    data entry. An empty list clears the restriction, leaving every design selectable.
+    Colours hang off a design, not the lot, so D1 can run red+blue while D2 runs
+    black only. A design may be listed only once and must bring at least one
+    colour. An empty list clears the restriction, leaving every design and colour
+    selectable during data entry.
     """
     batch = get_batch(db, batch_id)
-    wanted = list(dict.fromkeys(design_ids))  # de-duplicate, keep order
 
-    if wanted:
-        found = set(db.scalars(select(Design.id).where(Design.id.in_(wanted))).all())
-        missing = set(wanted) - found
+    seen_designs: set[int] = set()
+    for d in designs:
+        if d.design_id in seen_designs:
+            raise BadRequest(f"Design {d.design_id} is listed twice — add it only once")
+        seen_designs.add(d.design_id)
+        if not d.colors:
+            raise BadRequest(f"Design {d.design_id} needs at least one colour")
+        seen_colors: set[int] = set()
+        for c in d.colors:
+            if c.color_id in seen_colors:
+                raise BadRequest(f"Color {c.color_id} is listed twice on design {d.design_id}")
+            seen_colors.add(c.color_id)
+
+    if seen_designs:
+        found = set(db.scalars(select(Design.id).where(Design.id.in_(seen_designs))).all())
+        missing = seen_designs - found
         if missing:
             raise BadRequest(f"Unknown designs: {sorted(missing)}")
 
-    before = [bd.design_id for bd in batch.designs]
-    batch.designs = [BatchDesign(design_id=did) for did in wanted]
+    wanted_colors = {c.color_id for d in designs for c in d.colors}
+    if wanted_colors:
+        found = set(db.scalars(select(Color.id).where(Color.id.in_(wanted_colors))).all())
+        missing = wanted_colors - found
+        if missing:
+            raise BadRequest(f"Unknown colors: {sorted(missing)}")
+
+    before = _designs_snapshot(batch.designs)
+    # Flush the removals before inserting, so re-adding a design in the same call
+    # cannot collide with the row it is replacing on the (batch, design) key.
+    batch.designs.clear()
+    db.flush()
+    batch.designs = [
+        BatchDesign(
+            design_id=d.design_id,
+            colors=[
+                BatchDesignColor(color_id=c.color_id, quantity=c.quantity) for c in d.colors
+            ],
+        )
+        for d in designs
+    ]
+    db.flush()
     audit_service.record(
         db, entity_type="batch", entity_id=batch.id, action=AuditAction.UPDATE,
-        actor_id=actor_id, before={"designs": before}, after={"designs": wanted},
+        actor_id=actor_id,
+        before={"designs": before}, after={"designs": _designs_snapshot(batch.designs)},
     )
     db.commit()
     db.refresh(batch)
@@ -298,11 +312,28 @@ def _fields_by_scope(stage: Stage, scope: FieldScope):
     return [f for f in stage.field_defs if f.scope == scope.value]
 
 
-def _validate_design_color(db: Session, payload: StageEntrySubmit) -> None:
+def _validate_design_color(db: Session, batch: Batch, payload: StageEntrySubmit) -> None:
+    """Check the entry's design/colour exist and are a pair this lot actually runs."""
     if payload.design_id is not None and db.get(Design, payload.design_id) is None:
         raise BadRequest(f"Unknown design {payload.design_id}")
     if payload.color_id is not None and db.get(Color, payload.color_id) is None:
         raise BadRequest(f"Unknown color {payload.color_id}")
+
+    # No designs attached means the lot is unrestricted — anything goes.
+    if not batch.designs or payload.design_id is None:
+        return
+
+    lot_design = next((bd for bd in batch.designs if bd.design_id == payload.design_id), None)
+    if lot_design is None:
+        raise BadRequest(f"Design {payload.design_id} is not part of this lot")
+    # A design with no colours is only possible on lots created before colours
+    # moved under designs; treat it as unrestricted rather than blocking entry.
+    if payload.color_id is not None and lot_design.colors:
+        if all(c.color_id != payload.color_id for c in lot_design.colors):
+            raise BadRequest(
+                f"Color {payload.color_id} is not one of the colours attached to "
+                f"design {payload.design_id} in this lot"
+            )
 
 
 def _validate_payload_for_stage(stage: Stage, payload: StageEntrySubmit) -> tuple[dict, list[dict]]:
@@ -389,7 +420,7 @@ def create_stage_entry(
     """Add a new entry for a stage (a stage may have many entries per batch)."""
     batch = get_batch(db, batch_id)
     stage = template_service.get_stage(db, batch.template_id, stage_id)
-    _validate_design_color(db, payload)
+    _validate_design_color(db, batch, payload)
     clean_data, clean_machines = _validate_payload_for_stage(stage, payload)
 
     entry = StageEntry(batch_id=batch_id, stage_id=stage_id)
@@ -424,7 +455,7 @@ def create_stage_entries_bulk(
     all_errors: list[dict] = []
     for index, payload in enumerate(payloads):
         try:
-            _validate_design_color(db, payload)
+            _validate_design_color(db, batch, payload)
             clean_data, clean_machines = _validate_payload_for_stage(stage, payload)
         except DataValidationError as exc:
             all_errors.extend({**e, "index": index} for e in exc.errors)
@@ -469,7 +500,7 @@ def update_stage_entry(
 
     batch = get_batch(db, batch_id)
     stage = template_service.get_stage(db, batch.template_id, entry.stage_id)
-    _validate_design_color(db, payload)
+    _validate_design_color(db, batch, payload)
     clean_data, clean_machines = _validate_payload_for_stage(stage, payload)
 
     before = _entry_snapshot(entry)

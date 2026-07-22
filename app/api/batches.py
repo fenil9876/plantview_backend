@@ -11,7 +11,6 @@ from app.core.enums import BatchStatus
 from app.core.roles import Role
 from app.models.user import User
 from app.schemas.operations import (
-    BatchColorTargetsSet,
     BatchCreate,
     BatchDesignsSet,
     BatchMaterialsSet,
@@ -81,19 +80,6 @@ def set_batch_materials(
     return batch_service.set_batch_materials(db, batch_id, payload.materials, actor_id=current_user.id)
 
 
-@router.put("/{batch_id}/color-targets", response_model=BatchRead, dependencies=operator_or_admin)
-def set_batch_color_targets(
-    batch_id: int,
-    payload: BatchColorTargetsSet,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Set the planned per-color quantity split for this lot."""
-    return batch_service.set_batch_color_targets(
-        db, batch_id, payload.targets, actor_id=current_user.id
-    )
-
-
 @router.put("/{batch_id}/designs", response_model=BatchRead, dependencies=operator_or_admin)
 def set_batch_designs(
     batch_id: int,
@@ -101,9 +87,13 @@ def set_batch_designs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Set which designs this lot may use. Empty list = no restriction (all designs)."""
+    """Set the designs this lot runs and the colours under each.
+
+    Each design must be listed once and bring at least one colour. An empty list
+    = no restriction (all designs and colours selectable during entry).
+    """
     return batch_service.set_batch_designs(
-        db, batch_id, payload.design_ids, actor_id=current_user.id
+        db, batch_id, payload.designs, actor_id=current_user.id
     )
 
 
